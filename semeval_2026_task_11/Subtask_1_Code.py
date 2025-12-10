@@ -1,137 +1,87 @@
-from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, TrainingArguments, Trainer
+# Run !pip install transformers datasets evaluate accelerate torch before running the code
+# To run this code, "train_data.json" AND "Pilot_Data.json" need to be in the same file as the code
+
+import json
 import torch
 import numpy as np
-import evaluate
+from datasets import load_dataset
+from transformers import (AutoTokenizer, AutoModelForSequenceClassification, TrainingArguments, Trainer, DataCollatorWithPadding)
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+train_file = "train_data.json"
+pilot_file = "test_data_subtask_1.json"
+model_name = "roberta-large-mnli"
+max_length = 256
+batch_size = 8 
+num_epochs = 10 
+learning_rate = 1e-5 
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Device: {device} | Model: {model_name}")
+train_raw = load_dataset("json", data_files=train_file)
+pilot_raw = load_dataset("json", data_files=pilot_file)
+full_train_ds = train_raw["train"] if "train" in train_raw else train_raw
+pilot_ds = pilot_raw["train"] if "train" in pilot_raw else pilot_raw
+split_ds = full_train_ds.train_test_split(test_size=0.1, seed=42)
+train_ds = split_ds["train"]
+eval_ds = split_ds["test"]
+tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+def preprocess_train(batch):
+    inputs = [f"Determine validity: {x}" for x in batch["syllogism"]]
+    enc = tokenizer(inputs, truncation=True, max_length=max_length)
+    enc["labels"] = [int(v) for v in batch["validity"]]
+    return enc
 
-# -----------------------------
-# 1. Load your CSV datasets
-# -----------------------------
-# Load training data from eng.csv
-train_dataset = load_dataset("csv", data_files="/content/eng.csv")["train"]
+def preprocess_pilot(batch):
+    inputs = [f"Determine validity: {x}" for x in batch["syllogism"]]
+    enc = tokenizer(inputs, truncation=True, max_length=max_length)
+    enc["id"] = batch["id"]
+    return enc
 
-# Load test data from eng_test.csv
-test_dataset = load_dataset("csv", data_files="/content/eng_test.csv")["train"]
-
-# Print dataset column names to help identify correct labels and text column
-print("Available columns in training dataset:", train_dataset.column_names)
-print("Available columns in test dataset:", test_dataset.column_names)
-
-# The label columns in your dataset
-label_cols = ["anger", "fear", "joy", "sadness", "surprise"]
-num_labels = len(label_cols)
-
-# -----------------------------
-# 2. Tokenizer
-# -----------------------------
-model_name = "bert-base-uncased"
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-
-def tokenize(batch):
-    return tokenizer(batch["text"], truncation=True, padding="max_length", max_length=256)
-
-train_ds = train_dataset.map(tokenize, batched=True)
-test_ds = test_dataset.map(tokenize, batched=True)
-
-# -----------------------------
-# 3. Format labels
-# -----------------------------
-def format_labels(batch):
-    labels_np = np.column_stack([batch[col] for col in label_cols])
-    # Convert to float first to properly identify NaN values if any exist in the CSV
-    labels_float = labels_np.astype(float)
-
-    # Check for NaN values. If any are present, fill them with 0.
-    # In multi-label classification, a missing label typically means the absence of that label.
-    if np.isnan(labels_float).any():
-        print("Warning: NaN values found in original labels. Replacing with 0.")
-        labels_float = np.nan_to_num(labels_float, nan=0.0)
-
-    # Convert to float32, which is expected by BCEWithLogitsLoss
-    batch["labels"] = labels_float.astype(np.float32).tolist()
-    return batch
-
-train_ds = train_ds.map(format_labels, batched=True)
-test_ds = test_ds.map(format_labels, batched=True)
-
-# Remove unused columns
-train_ds = train_ds.remove_columns(["id", "text"])
-test_ds = test_ds.remove_columns(["id", "text"])
-
-train_ds.set_format("torch")
-test_ds.set_format("torch")
-
-# -----------------------------
-# 4. Load model
-# -----------------------------
-model = AutoModelForSequenceClassification.from_pretrained(
-    model_name,
-    num_labels=num_labels,
-    problem_type="multi_label_classification"
-)
-
-# -----------------------------
-# 5. Metrics
-# -----------------------------
-f1_metric = evaluate.load("f1")
-accuracy_metric = evaluate.load("accuracy")
-
+train_ds = train_ds.map(preprocess_train, batched=True, remove_columns=train_ds.column_names)
+eval_ds = eval_ds.map(preprocess_train, batched=True, remove_columns=eval_ds.column_names)
+pilot_ds = pilot_ds.map(preprocess_pilot, batched=True, remove_columns=pilot_ds.column_names)
 def compute_metrics(eval_pred):
     logits, labels = eval_pred
-    probs = torch.sigmoid(torch.tensor(logits)) # Convert logits to probabilities
-    preds = (probs > 0.5).int().numpy().astype(np.int32) # Ensure predictions are int32
+    predictions = np.argmax(logits, axis=-1)
+    acc = accuracy_score(labels, predictions)
+    precision, recall, f1, _ = precision_recall_fscore_support(labels, predictions, average='macro', zero_division=0)
+    return {"accuracy": acc, "f1": f1}
+model = AutoModelForSequenceClassification.from_pretrained(
+    model_name,
+    num_labels=2,
+    ignore_mismatched_sizes=True
+).to(device)
 
-    # labels is a numpy array from the Trainer's evaluation_loop because set_format("torch")
-    # converts the dataset elements to torch tensors, but the trainer's eval_loop yields numpy arrays.
-    # After fixing format_labels, `labels` should already be clean floats. Convert them to int for metrics calculation
-    references_for_metrics = labels.astype(np.int32) # Ensure labels are int32 for metrics
+collator = DataCollatorWithPadding(tokenizer)
+args = TrainingArguments(
+    output_dir="./model_output",
+    per_device_train_batch_size=batch_size,
+    per_device_eval_batch_size=batch_size,
+    num_train_epochs=num_epochs,
+    learning_rate=learning_rate,
+    weight_decay=0.01,
+    warmup_ratio=0.1,
 
-    # Flatten the predictions and references for the metrics
-    # This is a common requirement for evaluate metrics in multi-label scenarios with 'micro' averaging
-    preds_flat = preds.flatten()
-    references_flat = references_for_metrics.flatten()
-
-    f1 = f1_metric.compute(predictions=preds_flat, references=references_flat, average="micro")
-    acc = accuracy_metric.compute(predictions=preds_flat, references=references_flat)
-
-    return {
-        "micro_f1": f1["f1"],
-        "accuracy": acc["accuracy"]
-    }
-
-# -----------------------------
-# 6. Training Arguments
-# -----------------------------
-training_args = TrainingArguments(
-    output_dir="./results",
     eval_strategy="epoch",
     save_strategy="epoch",
-    logging_strategy="epoch",
-    learning_rate=2e-5,
-    num_train_epochs=3,
-    per_device_train_batch_size=8,
-    per_device_eval_batch_size=8,
-    weight_decay=0.01,
     load_best_model_at_end=True,
+    metric_for_best_model="accuracy",
     report_to="none"
 )
 
-# -----------------------------
-# 7. Train the model
-# -----------------------------
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_ds,
-    eval_dataset=test_ds,
-    tokenizer=tokenizer,
-    compute_metrics=compute_metrics
-)
-
+trainer = Trainer(model=model, args=args, train_dataset=train_ds, eval_dataset=eval_ds, data_collator=collator, tokenizer=tokenizer, compute_metrics=compute_metrics)
 trainer.train()
+print("Predicting...")
+pred_output = trainer.predict(pilot_ds)
+logits = pred_output.predictions
+probs = torch.softmax(torch.tensor(logits), dim=-1).numpy()
+preds = np.argmax(probs, axis=-1)
+ids = np.array(pilot_ds["id"])
 
-# -----------------------------
-# 8. Evaluate final accuracy
-# -----------------------------
-results = trainer.evaluate()
-print(results)
+pred_items = []
+for i, example_id in enumerate(ids):
+    pred_items.append({"id": str(example_id), "validity": bool(int(preds[i]))})
+
+with open("predictions.json", "w") as f:
+    json.dump(pred_items, f, indent=2)
+
+print("predictions.json created")
