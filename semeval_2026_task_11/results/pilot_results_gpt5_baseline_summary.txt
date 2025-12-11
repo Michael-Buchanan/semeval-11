@@ -1,0 +1,30 @@
+######################################################################
+--- RESULTS FOR GPT5-EndToEnd-Baseline ---
+######################################################################
+Overall Data Count: 80
+--------------------------------------------------
+[Group: ALL] Validity Accuracy: 83.75% (67 / 80)
+
+[Group: PLAUSIBLE (Plausibility: True)] Validity Accuracy: 92.50% (37 / 40)
+[Group: IMPLAUSIBLE (Plausibility: False)] Validity Accuracy: 75.00% (30 / 40)
+
+==================================================
+--- Content Effect Bias Metrics ---
+
+Conditional Accuracies (Validity Prediction):
+  Valid & Plausible (V/P) (N=20): 90.00%
+  Valid & Implausible (V/I) (N=20): 80.00%
+  Invalid & Plausible (IV/P) (N=20): 95.00%
+  Invalid & Implausible (IV/I) (N=20): 70.00%
+
+Calculated Content Effect Metrics (Bias towards Plausibility):
+  Intra-Validity Bias (acc_intra): 17.50%
+  Inter-Validity Bias (acc_inter): 7.50%
+  Total Content Effect (acc_tot): 12.50%
+
+==================================================
+--- Combined Performance Scores ---
+
+[2] Log-Smoothed Score (Accuracy / (1 + ln(1 + Bias))):
+    Score: 23.25
+==================================================

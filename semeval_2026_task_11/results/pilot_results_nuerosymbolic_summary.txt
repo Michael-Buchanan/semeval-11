@@ -1,0 +1,34 @@
+######################################################################
+--- RESULTS FOR NeuroSymbolic-GPT5 ---
+######################################################################
+Overall Data Count: 80
+--------------------------------------------------
+[Group: ALL] Validity Accuracy: 91.25% (73 / 80)
+
+[Group: PLAUSIBLE (Plausibility: True)] Validity Accuracy: 90.00% (36 / 40)
+[Group: IMPLAUSIBLE (Plausibility: False)] Validity Accuracy: 92.50% (37 / 40)
+
+==================================================
+--- Content Effect Bias Metrics ---
+
+Conditional Accuracies (Validity Prediction):
+  Valid & Plausible (V/P) (N=20): 80.00%
+  Valid & Implausible (V/I) (N=20): 85.00%
+  Invalid & Plausible (IV/P) (N=20): 100.00%
+  Invalid & Implausible (IV/I) (N=20): 100.00%
+
+Calculated Content Effect Metrics (Bias towards Plausibility):
+  Intra-Validity Bias (acc_intra): 2.50%
+  Inter-Validity Bias (acc_inter): 17.50%
+  Total Content Effect (acc_tot): 10.00%
+
+==================================================
+--- Combined Performance Scores ---
+
+[2] Log-Smoothed Score (Accuracy / (1 + ln(1 + Bias))):
+    Score: 26.85
+==================================================
+
+
+Detailed per-example log written to: C:\School\NLP\SemEvalTask11\semeval_2026_task_11\pilot_results.jsonl
+Summary metrics: {'name': 'NeuroSymbolic-GPT5', 'overall_acc': 91.25, 'tot_content_effect': 10.0, 'combined_smooth_score': 26.854859456821973}

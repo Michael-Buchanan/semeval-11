@@ -1,7 +1,7 @@
 import json
 import os
 from dataclasses import dataclass
-from typing import List, Dict
+from typing import List, Dict, Any, Tuple
 
 # =========================
 # SYMBOLIC REASONER
@@ -15,13 +15,12 @@ class Statement:
     negated_predicate: bool  # True = NOT predicate(x)
 
 
-def _build_statements(structured: Dict) -> (List[str], List[Statement], Statement):
+def _build_statements(structured: Dict[str, Any]) -> Tuple[List[str], List[Statement], Statement]:
     """
     Convert the JSON dict from the LLM into internal Statement objects.
     """
     terms: List[str] = structured["terms"]
 
-    # Quick sanity
     allowed_q = {"ALL", "SOME"}
 
     premises: List[Statement] = []
@@ -57,23 +56,38 @@ def _satisfies_statement(interp: Dict[str, List[bool]], stmt: Statement) -> bool
     Check if a given interpretation satisfies one Statement.
 
     interp: dict term_name -> list[bool] over domain indices (0..d-1)
+
+    IMPORTANT: For this task we use ARISTOTELIAN-style semantics
+    with existential import for universal statements:
+
+      "ALL A B"      means (forall x: A(x) -> B(x)) AND (exists x: A(x))
+      "ALL A NOT B"  means (forall x: A(x) -> ¬B(x)) AND (exists x: A(x))
+
+    "SOME A B" / "SOME A NOT B" keep the usual existential reading.
     """
     subject_vals = interp[stmt.subject]
     pred_vals = interp[stmt.predicate]
 
     if stmt.quantifier == "ALL":
-        # ∀x (subject(x) -> (neg ? !predicate(x) : predicate(x)))
+        # Existential import: require at least one subject instance.
+        seen_subject = False
+
+        # Check ∀x (A(x) -> (neg ? ¬B(x) : B(x))) and track existence of A(x)
         for i in range(len(subject_vals)):
             if subject_vals[i]:
+                seen_subject = True
                 pred_val = pred_vals[i]
                 if stmt.negated_predicate:
                     pred_val = not pred_val
                 if not pred_val:
+                    # Found an A that is not (B / ¬B) as required
                     return False
-        return True
+
+        # If no subject exists, the universal is FALSE under existential import.
+        return seen_subject
 
     elif stmt.quantifier == "SOME":
-        # ∃x (subject(x) & (neg ? !predicate(x) : predicate(x)))
+        # ∃x (A(x) ∧ (neg ? ¬B(x) : B(x)))
         for i in range(len(subject_vals)):
             if subject_vals[i]:
                 pred_val = pred_vals[i]
@@ -100,7 +114,7 @@ def _generate_all_interpretations(terms: List[str], domain_size: int):
     for mask in range(1 << total_bits):
         interp: Dict[str, List[bool]] = {}
         for t_idx, term in enumerate(terms):
-            vals = []
+            vals: List[bool] = []
             for i in range(domain_size):
                 bit_index = t_idx * domain_size + i
                 bit = (mask >> bit_index) & 1
@@ -109,18 +123,38 @@ def _generate_all_interpretations(terms: List[str], domain_size: int):
         yield interp
 
 
-def is_valid_syllogism(structured: Dict, max_domain_size: int = 4) -> bool:
+def is_valid_syllogism(
+    structured: Dict[str, Any],
+    max_domain_size: int = 4,
+    disallow_trivial_conclusion: bool = True,
+) -> bool:
     """
     Decide validity by checking for a countermodel.
 
     The argument is valid iff there is NO interpretation (up to max_domain_size)
     such that all premises are true and the conclusion is false.
 
-    This is sound and complete for monadic FOL with a finite number of predicates,
-    given a sufficiently large finite domain bound. Here we use up to 4, which is
-    enough for small syllogistic cases.
+    We use ARISTOTELIAN semantics with existential import for ALL statements.
+
+    Additional dataset-alignment heuristic (optional):
+    - If `disallow_trivial_conclusion` is True and the conclusion is exactly
+      identical to any premise (same quantifier, subject, predicate, negation),
+      we treat the syllogism as INVALID. This matches the dataset behavior
+      where arguments whose "conclusion" merely repeats a premise are labeled
+      invalid even though they are tautologically entailed in classical logic.
     """
     terms, premises, conclusion = _build_statements(structured)
+
+    if disallow_trivial_conclusion:
+        for p in premises:
+            if (
+                p.quantifier == conclusion.quantifier
+                and p.subject == conclusion.subject
+                and p.predicate == conclusion.predicate
+                and p.negated_predicate == conclusion.negated_predicate
+            ):
+                # Dataset treats "premise == conclusion" as not a genuine inference.
+                return False
 
     for d in range(1, max_domain_size + 1):
         for interp in _generate_all_interpretations(terms, d):

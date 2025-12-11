@@ -1,13 +1,35 @@
 import json
 import os
 import math
+import re
 from dataclasses import dataclass
 from typing import List, Dict, Any, Tuple, Optional
 
 from openai import OpenAI
 from dotenv import load_dotenv
-from analysis import LOG_PATH, analyze_log_file, run_pilot_evaluation
-from symbolic_solver import is_valid_syllogism
+#from symbolic_solver import is_valid_syllogism
+
+load_dotenv()
+
+# =========================
+# LLM CLIENT
+# =========================
+
+class LLMClient:
+  """
+  Abstract-ish wrapper so you can later plug in different backends.
+  For now, we implement a GPT-5-based client using OpenAI's Python SDK.
+  """
+
+  import json
+import os
+import math
+import re
+from dataclasses import dataclass
+from typing import List, Dict, Any, Tuple, Optional
+
+from openai import OpenAI
+from dotenv import load_dotenv
 
 load_dotenv()
 
@@ -17,8 +39,8 @@ load_dotenv()
 
 class LLMClient:
     """
-    Abstract-ish wrapper so you can later plug in different backends.
-    For now, we implement a GPT-5-based client using OpenAI's Python SDK.
+    Wrapper around GPT-5.1 that turns English syllogisms into
+    a canonical monadic logic format.
     """
 
     def __init__(self, model: str = "gpt-5.1"):
@@ -27,474 +49,291 @@ class LLMClient:
         self.system_prompt = self._build_system_prompt()
 
     def _build_system_prompt(self) -> str:
-        """
-        System prompt that defines the canonical representation and gives
-        TEN concrete examples (1 canonical + 9 from pilot errors).
-        """
         prompt = """
-You are a logic parser. Your only job is to transform English syllogisms into a small, 
-formal, content-agnostic JSON representation. You MUST ignore real-world plausibility and 
-only encode the logical quantifiers and predicates visible in the text.
+You are a logic parser. Your only job is to transform English syllogisms into a small,
+formal, content-agnostic CANONICAL TEXT representation (not JSON).
 
-Your output MUST be valid JSON with this exact structure:
+------------------------------------------------------------
+1. IDENTIFY PREMISES VS CONCLUSION
+------------------------------------------------------------
 
-{
-  "terms": [ "Term1", "Term2", ... ],
+The syllogism is given as 2–3 English sentences.
 
-  "premises": [
-    {
-      "quantifier": "ALL" | "SOME",
-      "subject": "TermName",
-      "predicate": "TermName",
-      "negated_predicate": true | false
-    },
-    ...
-  ],
+- Sentences that appear BEFORE words like:
+    "Therefore", "Thus", "Hence", "Consequently",
+    "It follows that", "It logically follows that",
+    "As a result", "It is therefore the case that"
+  are PREMISES.
 
-  "conclusion": {
-    "quantifier": "ALL" | "SOME",
-    "subject": "TermName",
-    "predicate": "TermName",
-    "negated_predicate": true | false
-  }
-}
+- The sentence introduced by one of these cue phrases
+  is the CONCLUSION.
 
-Semantics:
+- If there is NO explicit cue phrase, treat the LAST sentence
+  as the CONCLUSION, and all previous sentences as PREMISES.
 
-- "ALL" means: for all x, if subject(x) then (negated_predicate ? NOT predicate(x) : predicate(x)).
-- "SOME" means: there exists an x such that subject(x) AND (negated_predicate ? NOT predicate(x) : predicate(x)).
+IMPORTANT:
+- DO NOT list the conclusion as a PREMISE.
+- Each logical statement should appear exactly once:
+  as either a PREMISE_k or as the CONCLUSION, not both.
 
-You must map common phrasings to this scheme:
+------------------------------------------------------------
+2. CANONICAL FORMAT
+------------------------------------------------------------
 
-- "All A are B", "Every A is B", "Each A is B", "Anything that is A is B"
-    => quantifier = "ALL", subject = A, predicate = B, negated_predicate = false
+You MUST output exactly in this format:
 
-- "No A are B", "Nothing that is A is B", "It is true that no A is B"
-    => quantifier = "ALL", subject = A, predicate = B, negated_predicate = true
-       (because "no A are B" = "all A are not B")
+TERMS: Term1, Term2, Term3
 
-- "Some A are B", "A number of A are B", "A portion of A are B"
-    => quantifier = "SOME", subject = A, predicate = B, negated_predicate = false
+PREMISE 1: ALL TermA TermB
+PREMISE 2: SOME TermC NOT TermD
+...
 
-- "Some A are not B", "A portion of A are not B"
-    => quantifier = "SOME", subject = A, predicate = B, negated_predicate = true
+CONCLUSION: ALL TermX TermY
+or
+CONCLUSION: SOME TermX NOT TermY
 
+------------------------------------------------------------
+3. RULES FOR TERM NAMES
+------------------------------------------------------------
+
+- Each term name MUST be a single identifier with no spaces, e.g.:
+  Canine, Fish, Mammal, TeachingFellow, ZoneOfLife.
+- Reuse the SAME identifier for the SAME concept across all premises
+  and the conclusion.
+- Do NOT introduce extra terms that are not in the syllogism.
+- If the English surface form has spaces, convert to a single identifier:
+  "odd-toed ungulate" -> OddToedUngulate
+  "area of dense tropical forest" -> AreaOfDenseTropicalForest
+
+------------------------------------------------------------
+4. QUANTIFIERS AND NEGATION
+------------------------------------------------------------
+
+- Quantifier is either ALL or SOME (UPPERCASE).
+
+- If the predicate is negated, insert the word NOT before it.
+    Example: SOME Canine NOT Fish
+- If the predicate is not negated, omit NOT.
+    Example: ALL Canine Mammal
+
+Logical mapping examples:
+- "All A are B", "Every A is B", "Each A is B"
+    => ALL A B
+- "No A are B", "Nothing that is A is B"
+    => ALL A NOT B
+- "Some A are B"
+    => SOME A B
+- "Some A are not B"
+    => SOME A NOT B
 - "Not all A are B"
-    => quantifier = "SOME", subject = A, predicate = B, negated_predicate = true
-       (because "not all A are B" = "some A are not B")
+    => SOME A NOT B
 
-You must:
-- Use exactly the same term name string for the same concept across the premises and conclusion.
-- Introduce a finite set of term names, listed in "terms".
-- Not invent or remove logical content: only encode what is explicitly stated in the syllogism.
-- Respond with ONLY the JSON object, no explanations, no extra text.
+------------------------------------------------------------
+5. YOUR TASK
+------------------------------------------------------------
 
-====================================================
+- Read the English syllogism.
+- Split into premises and conclusion as described above.
+- Identify the minimal set of abstract terms.
+- Write the TERMS line.
+- Write each premise as a PREMISE k: ... line.
+- Write the conclusion as the CONCLUSION: ... line.
+- IGNORE real-world plausibility; treat terms as abstract symbols.
+- Output ONLY these lines, no extra prose, no JSON, no explanations.
+
+------------------------------------------------------------
+6. EXAMPLES
+------------------------------------------------------------
+
 EXAMPLE 1
-----------------------------------------------------
-Input syllogism (English):
-Not all canines are aquatic creatures known as fish. It is certain that no fish belong to the class of mammals. Therefore, every canine falls under the category of mammals.
+----------------------------
+English:
+"Not all canines are aquatic creatures known as fish.
+It is certain that no fish belong to the class of mammals.
+Therefore, every canine falls under the category of mammals."
 
-Correct JSON output:
-{
-  "terms": ["Canine", "Fish", "Mammal"],
-  "premises": [
-    {
-      "quantifier": "SOME",
-      "subject": "Canine",
-      "predicate": "Fish",
-      "negated_predicate": true
-    },
-    {
-      "quantifier": "ALL",
-      "subject": "Fish",
-      "predicate": "Mammal",
-      "negated_predicate": true
-    }
-  ],
-  "conclusion": {
-    "quantifier": "ALL",
-    "subject": "Canine",
-    "predicate": "Mammal",
-    "negated_predicate": false
-  }
-}
+Canonical output:
+TERMS: Canine, Fish, Mammal
+PREMISE 1: SOME Canine NOT Fish
+PREMISE 2: ALL Fish NOT Mammal
+CONCLUSION: ALL Canine Mammal
 
-====================================================
-EXAMPLE 2 (ID 1)
-----------------------------------------------------
-Input syllogism (English):
-All birds lay eggs. All chickens lay eggs. All chickens are birds.
+EXAMPLE 2
+----------------------------
+English:
+"All birds lay eggs. All chickens lay eggs. All chickens are birds."
 
-Correct JSON output:
-{
-  "terms": ["Bird", "Chicken", "EggLayer"],
-  "premises": [
-    {
-      "quantifier": "ALL",
-      "subject": "Bird",
-      "predicate": "EggLayer",
-      "negated_predicate": false
-    },
-    {
-      "quantifier": "ALL",
-      "subject": "Chicken",
-      "predicate": "EggLayer",
-      "negated_predicate": false
-    },
-    {
-      "quantifier": "ALL",
-      "subject": "Chicken",
-      "predicate": "Bird",
-      "negated_predicate": false
-    }
-  ],
-  "conclusion": {
-    "quantifier": "ALL",
-    "subject": "Chicken",
-    "predicate": "Bird",
-    "negated_predicate": false
-  }
-}
+Here the syllogism has no explicit cue word, so:
+- First two sentences are PREMISES.
+- LAST sentence is the CONCLUSION.
 
-====================================================
-EXAMPLE 3 (ID 2)
-----------------------------------------------------
-Input syllogism (English):
-There are some bridges that are considered artifacts. All items categorized as structures are artifacts. It is true that every bridge is a structure.
+Canonical output:
+TERMS: Bird, Chicken, EggLayer
+PREMISE 1: ALL Bird EggLayer
+PREMISE 2: ALL Chicken EggLayer
+CONCLUSION: ALL Chicken Bird
 
-Correct JSON output:
-{
-  "terms": ["Bridge", "Artifact", "Structure"],
-  "premises": [
-    {
-      "quantifier": "SOME",
-      "subject": "Bridge",
-      "predicate": "Artifact",
-      "negated_predicate": false
-    },
-    {
-      "quantifier": "ALL",
-      "subject": "Structure",
-      "predicate": "Artifact",
-      "negated_predicate": false
-    },
-    {
-      "quantifier": "ALL",
-      "subject": "Bridge",
-      "predicate": "Structure",
-      "negated_predicate": false
-    }
-  ],
-  "conclusion": {
-    "quantifier": "SOME",
-    "subject": "Bridge",
-    "predicate": "Artifact",
-    "negated_predicate": false
-  }
-}
+EXAMPLE 3
+----------------------------
+English:
+"Every sanctuary is classified as a type of place.
+All sanctuaries belong to the category of geographical areas.
+It follows that some geographical areas are indeed places."
 
-====================================================
-EXAMPLE 4 (ID 4)
-----------------------------------------------------
-Input syllogism (English):
-There are certain activities that can be classified as coverings. Some acts of protecting function as coverings. Every act of protecting qualifies as an activity.
+Canonical output:
+TERMS: Sanctuary, Place, GeographicalArea
+PREMISE 1: ALL Sanctuary Place
+PREMISE 2: ALL Sanctuary GeographicalArea
+CONCLUSION: SOME GeographicalArea Place
 
-Correct JSON output:
-{
-  "terms": ["Activity", "Covering", "Act of protecting"],
-  "premises": [
-    {
-      "quantifier": "SOME",
-      "subject": "Activity",
-      "predicate": "Covering",
-      "negated_predicate": false
-    },
-    {
-      "quantifier": "SOME",
-      "subject": "Act of protecting",
-      "predicate": "Covering",
-      "negated_predicate": false
-    },
-    {
-      "quantifier": "ALL",
-      "subject": "Act of protecting",
-      "predicate": "Activity",
-      "negated_predicate": false
-    }
-  ],
-  "conclusion": {
-    "quantifier": "SOME",
-    "subject": "Activity",
-    "predicate": "Covering",
-    "negated_predicate": false
-  }
-}
-
-====================================================
-EXAMPLE 5 (ID 5)
-----------------------------------------------------
-Input syllogism (English):
-Some sadnesses are not trees. All sadnesses are emotions. No trees are emotions.
-
-Correct JSON output:
-{
-  "terms": ["Sadness", "Tree", "Emotion"],
-  "premises": [
-    {
-      "quantifier": "SOME",
-      "subject": "Sadness",
-      "predicate": "Tree",
-      "negated_predicate": true
-    },
-    {
-      "quantifier": "ALL",
-      "subject": "Sadness",
-      "predicate": "Emotion",
-      "negated_predicate": false
-    },
-    {
-      "quantifier": "ALL",
-      "subject": "Tree",
-      "predicate": "Emotion",
-      "negated_predicate": true
-    }
-  ],
-  "conclusion": {
-    "quantifier": "SOME",
-    "subject": "Sadness",
-    "predicate": "Tree",
-    "negated_predicate": true
-  }
-}
-
-====================================================
-EXAMPLE 6 (ID 9)
-----------------------------------------------------
-Input syllogism (English):
-A portion of sculptures are considered plastic arts. Statues are among the various forms of plastic arts. Every single statue is a type of sculpture.
-
-Correct JSON output:
-{
-  "terms": ["Sculpture", "Plastic art", "Statue"],
-  "premises": [
-    {
-      "quantifier": "SOME",
-      "subject": "Sculpture",
-      "predicate": "Plastic art",
-      "negated_predicate": false
-    },
-    {
-      "quantifier": "ALL",
-      "subject": "Statue",
-      "predicate": "Plastic art",
-      "negated_predicate": false
-    },
-    {
-      "quantifier": "ALL",
-      "subject": "Statue",
-      "predicate": "Sculpture",
-      "negated_predicate": false
-    }
-  ],
-  "conclusion": {
-    "quantifier": "SOME",
-    "subject": "Sculpture",
-    "predicate": "Plastic art",
-    "negated_predicate": false
-  }
-}
-
-====================================================
-EXAMPLE 7 (ID 10)
-----------------------------------------------------
-Input syllogism (English):
-A fraction of all organisms are classified as postdiluvian. Among those that are postdiluvian, a certain group does not include succulents. No members of the organism kingdom are succulents.
-
-Correct JSON output:
-{
-  "terms": ["Organism", "Postdiluvian", "Succulent"],
-  "premises": [
-    {
-      "quantifier": "SOME",
-      "subject": "Organism",
-      "predicate": "Postdiluvian",
-      "negated_predicate": false
-    },
-    {
-      "quantifier": "SOME",
-      "subject": "Postdiluvian",
-      "predicate": "Succulent",
-      "negated_predicate": true
-    },
-    {
-      "quantifier": "ALL",
-      "subject": "Organism",
-      "predicate": "Succulent",
-      "negated_predicate": true
-    }
-  ],
-  "conclusion": {
-    "quantifier": "SOME",
-    "subject": "Organism",
-    "predicate": "Succulent",
-    "negated_predicate": true
-  }
-}
-
-====================================================
-EXAMPLE 8 (ID 14)
-----------------------------------------------------
-Input syllogism (English):
-There exist families that are also foster families. Some of the individuals who are foster families are not hammers. No family is a hammer.
-
-Correct JSON output:
-{
-  "terms": ["Family", "FosterFamily", "Hammer"],
-  "premises": [
-    {
-      "quantifier": "SOME",
-      "subject": "Family",
-      "predicate": "FosterFamily",
-      "negated_predicate": false
-    },
-    {
-      "quantifier": "SOME",
-      "subject": "FosterFamily",
-      "predicate": "Hammer",
-      "negated_predicate": true
-    },
-    {
-      "quantifier": "ALL",
-      "subject": "Family",
-      "predicate": "Hammer",
-      "negated_predicate": true
-    }
-  ],
-  "conclusion": {
-    "quantifier": "SOME",
-    "subject": "Family",
-    "predicate": "Hammer",
-    "negated_predicate": true
-  }
-}
-
-====================================================
-EXAMPLE 9 (ID 21)
-----------------------------------------------------
-Input syllogism (English):
-Every single plankton is an organism. No cheese is a plankton. Consequently, there exist organisms that are not cheeses.
-
-Correct JSON output:
-{
-  "terms": ["Plankton", "Organism", "Cheese"],
-  "premises": [
-    {
-      "quantifier": "ALL",
-      "subject": "Plankton",
-      "predicate": "Organism",
-      "negated_predicate": false
-    },
-    {
-      "quantifier": "ALL",
-      "subject": "Cheese",
-      "predicate": "Plankton",
-      "negated_predicate": true
-    }
-  ],
-  "conclusion": {
-    "quantifier": "SOME",
-    "subject": "Organism",
-    "predicate": "Cheese",
-    "negated_predicate": true
-  }
-}
-
-====================================================
-EXAMPLE 10 (ID 23)
-----------------------------------------------------
-Input syllogism (English):
-Every sanctuary is classified as a type of place. All sanctuaries belong to the category of geographical areas. It follows that some geographical areas are indeed places.
-
-Correct JSON output:
-{
-  "terms": ["Sanctuary", "Place", "GeographicalArea"],
-  "premises": [
-    {
-      "quantifier": "ALL",
-      "subject": "Sanctuary",
-      "predicate": "Place",
-      "negated_predicate": false
-    },
-    {
-      "quantifier": "ALL",
-      "subject": "Sanctuary",
-      "predicate": "GeographicalArea",
-      "negated_predicate": false
-    }
-  ],
-  "conclusion": {
-    "quantifier": "SOME",
-    "subject": "GeographicalArea",
-    "predicate": "Place",
-    "negated_predicate": false
-  }
-}
-
-====================================================
+============================
 END OF EXAMPLES
-====================================================
+============================
 
-When I give you a new syllogism, you MUST respond with ONLY the JSON, no explanations.
-"""
-        return prompt.strip()
+When I give you a new syllogism, you MUST respond with ONLY the
+canonical lines in this format (TERMS / PREMISE / CONCLUSION).
+""".strip()
 
-    def parse_syllogism(self, syllogism_text: str) -> Dict:
+        return prompt
+
+    def parse_syllogism(self, syllogism_text: str) -> Dict[str, Any]:
         """
-        Calls LLM to parse the syllogism into the canonical JSON representation.
+        Step A: Call LLM to produce canonical textual form.
+        Step B: Parse canonical text into the JSON structure expected
+                by is_valid_syllogism().
         """
         user_msg = f'Here is the syllogism:\n"""{syllogism_text}"""'
 
-        # Using Responses API as in your code
         response = self.client.responses.create(
             model=self.model,
             input=[
                 {
                     "role": "system",
-                    "content": self.system_prompt + "\n" + user_msg,
+                    "content": self.system_prompt,
+                },
+                {
+                    "role": "user",
+                    "content": user_msg,
                 },
             ],
         )
 
-        content = response.output_text
-        # Parse JSON from the model's output
-        try:
-            parsed = json.loads(content)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Model did not return valid JSON. Raw output:\n{content}") from e
+        canonical_text = response.output_text.strip()
+        structured = canonical_to_json(canonical_text)
+        return structured
 
-        return parsed
+def canonical_to_json(canonical: str) -> Dict[str, Any]:
+    """
+    Parse the canonical textual form:
 
-# =========================
-# MAIN MENU
-# =========================
+        TERMS: A, B, C
+        PREMISE 1: ALL A B
+        PREMISE 2: SOME A NOT C
+        CONCLUSION: SOME B NOT C
 
-def main():
-    print("=== Syllogistic Reasoning Evaluation ===")
-    print("1) Run full pilot evaluation (LLM + solver + write log)")
-    print("2) Compute metrics from existing log file")
-    choice = input("Select option (1/2): ").strip()
+    into the JSON structure:
 
-    if choice == "1":
-        run_pilot_evaluation()
-    elif choice == "2":
-        path = input(f"Enter log file path (default: {LOG_PATH}): ").strip()
-        if not path:
-            path = LOG_PATH
-        analyze_log_file(path)
-    else:
-        print("Invalid choice. Exiting.")
+    {
+      "terms": [...],
+      "premises": [
+        {"quantifier": "ALL", "subject": "A", "predicate": "B", "negated_predicate": False},
+        ...
+      ],
+      "conclusion": {...}
+    }
 
+    Assumes the model followed the format exactly.
+    Raises ValueError if something important is missing.
+    """
+    # Strip blank lines
+    lines = [ln.strip() for ln in canonical.splitlines() if ln.strip()]
+    terms: List[str] = []
+    premises: List[Dict[str, Any]] = []
+    conclusion: Optional[Dict[str, Any]] = None
 
-if __name__ == "__main__":
-    main()
+    # Helper to parse a "Q S [NOT] P" clause
+    def parse_clause(tokens: List[str]) -> Dict[str, Any]:
+        if len(tokens) < 3:
+            raise ValueError(f"Cannot parse clause from tokens: {tokens}")
+        q = tokens[0].upper()
+        if q not in {"ALL", "SOME"}:
+            raise ValueError(f"Unknown quantifier: {q}")
+
+        subj = tokens[1]
+
+        if len(tokens) == 3:
+            # Q S P
+            neg = False
+            pred = tokens[2]
+        else:
+            # Q S NOT P
+            if tokens[2].upper() != "NOT":
+                raise ValueError(f"Unexpected token (expected NOT): {tokens[2]}")
+            if len(tokens) != 4:
+                raise ValueError(f"Cannot parse NOT-clause from tokens: {tokens}")
+            neg = True
+            pred = tokens[3]
+
+        return {
+            "quantifier": q,
+            "subject": subj,
+            "predicate": pred,
+            "negated_predicate": neg,
+        }
+
+    # Main parse loop
+    for line in lines:
+        upper = line.upper()
+
+        # TERMS line
+        if upper.startswith("TERMS:"):
+            after = line.split(":", 1)[1]
+            raw_terms = [t.strip() for t in after.split(",") if t.strip()]
+            if not raw_terms:
+                raise ValueError("TERMS line found but no terms parsed.")
+            terms = raw_terms
+
+        # PREMISE lines
+        elif upper.startswith("PREMISE"):
+            # Pattern: "PREMISE k: Q S [NOT] P"
+            m = re.match(r"PREMISE\s+\d+\s*:\s*(.+)$", line, flags=re.IGNORECASE)
+            if not m:
+                raise ValueError(f"Could not parse PREMISE line: {line}")
+            clause_str = m.group(1).strip()
+            tokens = clause_str.split()
+            premises.append(parse_clause(tokens))
+
+        # CONCLUSION line
+        elif upper.startswith("CONCLUSION:"):
+            after = line.split(":", 1)[1].strip()
+            tokens = after.split()
+            conclusion = parse_clause(tokens)
+
+        else:
+            # Ignore stray lines (ideally there are none)
+            continue
+
+    if not terms:
+        raise ValueError("No TERMS line parsed from canonical output.")
+    if not premises:
+        raise ValueError("No PREMISE lines parsed from canonical output.")
+    if conclusion is None:
+        raise ValueError("No CONCLUSION line parsed from canonical output.")
+
+    # Optionally ensure that all mentioned term names are in the terms list
+    mentioned_terms = set()
+    for p in premises:
+        mentioned_terms.add(p["subject"])
+        mentioned_terms.add(p["predicate"])
+    mentioned_terms.add(conclusion["subject"])
+    mentioned_terms.add(conclusion["predicate"])
+
+    for t in sorted(mentioned_terms):
+        if t not in terms:
+            terms.append(t)
+
+    return {
+        "terms": terms,
+        "premises": premises,
+        "conclusion": conclusion,
+    }

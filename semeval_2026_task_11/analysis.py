@@ -5,6 +5,7 @@ from typing import Dict, List, Tuple, Optional, Any
 
 from llm_to_symbolic import LLMClient
 from symbolic_solver import is_valid_syllogism
+from baseline_llm import GPT5BaselineClient
 
 # =========================
 # METRIC FUNCTIONS
@@ -200,7 +201,8 @@ def analyze_model_performance(
 
 PILOT_DATA_PATH = "pilot data/syllogistic_reasoning_binary_pilot_en.json"
 LOG_PATH = "pilot_results.jsonl"
-
+TEST_DATA_PATH = "test_data/test_data_subtask_1.json"
+TEST_PREDICTIONS_PATH = "test_data/test_predictions_neurosymbolic.json"
 
 # =========================
 # PILOT EVAL (OPTION 1)
@@ -336,3 +338,148 @@ def analyze_log_file(
     )
     print("Summary metrics:", results)
     return results
+
+PILOT_DATA_PATH = "pilot data/syllogistic_reasoning_binary_pilot_en.json"
+LOG_PATH_BASELINE = "pilot_results_gpt5_baseline.jsonl"
+
+# from above:
+# from gpt5_baseline_client import GPT5BaselineClient   # if you put it in a separate module
+# or just use the class defined above directly.
+
+
+def run_pilot_evaluation_gpt5_baseline():
+    # 1. Load pilot ground truth
+    with open(PILOT_DATA_PATH, "r", encoding="utf-8") as f:
+        ground_truth: List[Dict[str, Any]] = json.load(f)
+
+    gt_map: Dict[str, Any] = {item["id"]: item for item in ground_truth}
+    print(f"Loaded {len(ground_truth)} pilot examples from {PILOT_DATA_PATH}")
+
+    # 2. Instantiate GPT-5 baseline client
+    llm = GPT5BaselineClient(model="gpt-5.1")  # or "gpt-5.1-mini" etc.
+    print("Initialized GPT-5 baseline LLM client.")
+
+    predictions: List[Dict[str, Any]] = []
+
+    # 3. Open log file
+    print(f"Processing examples and writing detailed log to {LOG_PATH_BASELINE}...")
+    with open(LOG_PATH_BASELINE, "w", encoding="utf-8") as log_f:
+        for idx, item in enumerate(ground_truth):
+            sid = item["id"]
+            text = item["syllogism"]
+            gold_validity = item["validity"]
+            gold_plaus = item["plausibility"]
+
+            try:
+                judgment = llm.judge_syllogism(text)
+                predicted_validity = judgment.validity
+                predicted_plausibility = judgment.plausibility
+
+                predictions.append({
+                    "id": sid,
+                    "validity": predicted_validity,
+                    "plausibility": predicted_plausibility,
+                })
+
+                log_entry = {
+                    "id": sid,
+                    "syllogism": text,
+                    "gold_validity": gold_validity,
+                    "gold_plausibility": gold_plaus,
+                    "predicted_validity": predicted_validity,
+                    "predicted_plausibility": predicted_plausibility,
+                    "correct_validity": predicted_validity == gold_validity,
+                }
+                if idx % 5 == 0:
+                    print(log_entry)
+
+            except Exception as e:
+                # On any failure, we still log but skip adding a prediction
+                log_entry = {
+                    "id": sid,
+                    "syllogism": text,
+                    "gold_validity": gold_validity,
+                    "gold_plausibility": gold_plaus,
+                    "predicted_validity": None,
+                    "predicted_plausibility": None,
+                    "correct_validity": False,
+                    "error": str(e),
+                }
+
+            log_f.write(json.dumps(log_entry) + "\n")
+
+            if (idx + 1) % 50 == 0:
+                print(f"Processed {idx + 1} items...")
+
+    # 4. Analyze performance using your existing metrics
+    results = analyze_model_performance(
+        model_name="GPT5-EndToEnd-Baseline",
+        ground_truth=ground_truth,
+        predictions=predictions,
+        gt_map=gt_map,
+    )
+
+    print("\n\nDetailed per-example log written to:", os.path.abspath(LOG_PATH_BASELINE))
+    print("Summary metrics:", results)
+
+def run_neurosymbolic_test_inference():
+    """
+    Run the NeuroSymbolic pipeline on the official Subtask 1 test data and
+    write a JSON file with the format:
+
+    [
+        {"id": "...", "validity": true},
+        {"id": "...", "validity": false},
+        ...
+    ]
+    """
+    if not os.path.exists(TEST_DATA_PATH):
+        print(f"Test data not found at: {TEST_DATA_PATH}")
+        return
+
+    # 1. Load test data (no ground truth labels here)
+    with open(TEST_DATA_PATH, "r", encoding="utf-8") as f:
+        test_items: List[Dict[str, Any]] = json.load(f)
+
+    print(f"Loaded {len(test_items)} test items from {TEST_DATA_PATH}")
+
+    # 2. Instantiate the NeuroSymbolic LLM client
+    llm = LLMClient(model="gpt-5.1")  # same as pilot; change if needed
+    print("Initialized NeuroSymbolic LLM client.")
+
+    predictions: List[Dict[str, Any]] = []
+
+    # 3. Run symbolic solver on each test syllogism
+    for idx, item in enumerate(test_items):
+        sid = item.get("id")
+        text = item.get("syllogism")
+
+        if sid is None or text is None:
+            # Skip malformed items just in case
+            continue
+
+        try:
+            structured = llm.parse_syllogism(text)
+            predicted_validity = is_valid_syllogism(structured)
+
+            predictions.append({
+                "id": sid,
+                "validity": predicted_validity,
+            })
+
+            if idx % 20 == 0:
+                print(f"Example prediction [{idx}]: {{'id': {sid}, 'validity': {predicted_validity}}}")
+
+        except Exception as e:
+            print(f"Error processing id {sid}: {e}")
+            # For the shared-task output, we typically want a prediction
+            # for every id. If you'd rather fail hard, you can `raise` instead.
+            # For now, we skip this item so the file stays valid JSON.
+
+    # 4. Write predictions in the required Subtask 1 format
+    os.makedirs(os.path.dirname(TEST_PREDICTIONS_PATH), exist_ok=True)
+    with open(TEST_PREDICTIONS_PATH, "w", encoding="utf-8") as f:
+        json.dump(predictions, f, indent=4)
+
+    print("\nWrote test predictions to:", os.path.abspath(TEST_PREDICTIONS_PATH))
+    print(f"Total predictions written: {len(predictions)}")
